@@ -387,6 +387,11 @@ ifeq ($(USE_DIST_KVSTORE), 1)
 	LIB_DEP += $(PS_PATH)/build/libps.a
 	LDFLAGS += $(PS_LDFLAGS_A)
 endif
+ifeq ($(USE_RDMA), 1)
+	CFLAGS += -DDMLC_USE_RDMA
+	LDFLAGS += -lrdmacm -libverbs -lpthread
+	LIBS += -lrdmacm -libverbs
+endif
 
 .PHONY: clean all extra-packages test lint docs clean_all rcpplint rcppexport roxygen\
 	cython2 cython3 cython cyclean

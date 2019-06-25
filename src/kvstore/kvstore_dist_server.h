@@ -18,6 +18,7 @@
  */
 
 /*!
+ * Copyright 2019 ByteDance Inc. or its affiliates. All Rights Reserved.
  * Copyright (c) 2015 by Contributors
  * \file mxnet_node.h
  * \brief implement mxnet nodes
@@ -35,6 +36,9 @@
 #include <functional>
 #include <future>
 #include <vector>
+#include <fstream>
+#include <chrono>
+#include <atomic>
 #include "../profiler/profiler.h"
 #include "../operator/tensor/elemwise_binary_op-inl.h"
 #include "../operator/tensor/init_op.h"
@@ -157,13 +161,24 @@ class KVStoreDistServer {
   KVStoreDistServer() {
     using namespace std::placeholders;
     ps_server_ = new ps::KVServer<char>(0);
+    enable_pull_zero_copy_ = dmlc::GetEnv("ENABLE_PULL_ZERO_COPY", true);
+    if (enable_pull_zero_copy_) {
+      LOG(INFO) << "Enable zero copy of pull operations.";
+    }
+
+    log_key_info_ = dmlc::GetEnv("PS_KEY_LOG", false);
+    if (log_key_info_) {
+      LOG(INFO) << "Log key information at PS";
+    }
+
     static_cast<ps::SimpleApp*>(ps_server_)->set_request_handle(
         std::bind(&KVStoreDistServer::CommandHandle, this, _1, _2));
     ps_server_->set_request_handle(
         std::bind(&KVStoreDistServer::DataHandleEx, this, _1, _2, _3));
-    sync_mode_ = false;
+    sync_mode_ = dmlc::GetEnv("IS_PS_SYNC_MODE", true);
     gradient_compression_ = std::make_shared<GradientCompression>();
     log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
+    update_buf_wait_ = dmlc::GetEnv("PS_ENABLE_GRADIENT_WAIT", false);
   }
 
   ~KVStoreDistServer() {
@@ -343,31 +358,16 @@ class KVStoreDistServer {
     return multi_precision_ && type.dtype != mshadow::kFloat32;
   }
 
-  inline void ApplyUpdates(const DataHandleType type, const int key,
+  inline void ApplyUpdates(const DataHandleType type, const uint64_t key,
                            UpdateBuf *update_buf, ps::KVServer<char>* server) {
     if (!sync_mode_ || update_buf->request.size() == (size_t) ps::NumWorkers()) {
-      // let the main thread to execute updater_, which is necessary for python
       auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
       auto& update =  sync_mode_ ? update_buf->merged : update_buf->temp_array;
-      if (updater_) {
-        exec_.Exec([this, key, &update, &stored](){
-          CHECK(updater_);
-          updater_(key, update, &stored);
-        });
-      } else {
-        CHECK(sync_mode_) << "Updater needs to be set for async mode";
-        // if no updater, just copy
-        CopyFromTo(update_buf->merged, &stored);
-      }
-
-      if (log_verbose_)  {
-        LOG(INFO) << "sent response to " << update_buf->request.size() << " workers";
-      }
-      for (const auto& req : update_buf->request) {
-        server->Response(req);
-      }
-      update_buf->request.clear();
+      // NOTE: not sure whether we need this WaitToRead, default is disabled
+      if (update_buf_wait_) update_buf->merged.WaitToRead();
+      CopyFromTo(update_buf->merged, &stored);
       if (has_multi_precision_copy(type)) CopyFromTo(stored, store_[key]);
+      update_buf->request.clear();
       stored.WaitToRead();
     } else {
       update_buf->merged.WaitToRead();
@@ -378,7 +378,7 @@ class KVStoreDistServer {
                     const int64_t master_key, const int64_t num_rows) {
     indices[0] = 0;
     for (int64_t i = 1; i <= num_rows; i++) {
-      int key = DecodeKey(keys[i]);
+      uint64_t key = DecodeKey(keys[i]);
       auto row_id = key - master_key;
       indices[i - 1] = row_id;
     }
@@ -432,7 +432,7 @@ class KVStoreDistServer {
     response.vals.resize(len);
     #pragma omp parallel for
     for (size_t i = 1; i <= num_rows; i++) {
-      int key = DecodeKey(req_data.keys[i]);
+      uint64_t key = DecodeKey(req_data.keys[i]);
       int64_t row_id = key - master_key;
       const auto src = data + row_id * unit_size;
       auto begin = (i - 1) * unit_size;
@@ -499,7 +499,7 @@ class KVStoreDistServer {
   void DataHandleRowSparse(const DataHandleType type, const ps::KVMeta& req_meta,
                            const ps::KVPairs<char>& req_data,
                            ps::KVServer<char>* server) {
-    int master_key = DecodeKey(req_data.keys[0]);
+    uint64_t master_key = DecodeKey(req_data.keys[0]);
     auto num_rows = req_data.keys.size() - 1;
     auto& stored = store_[master_key];
     if (req_meta.push) {
@@ -579,24 +579,47 @@ class KVStoreDistServer {
     }
   }
 
+  std::unordered_map<int, ps::KVPairs<char> > server_response_map;
+
   void DefaultStorageResponse(const DataHandleType type,
                               const int key,
                               const ps::KVMeta& req_meta,
                               const ps::KVPairs<char> &req_data,
                               ps::KVServer<char>* server) {
-    ps::KVPairs<char> response;
     const NDArray& stored = store_[key];
     CHECK(!stored.is_none()) << "init " << key << " first";
-
     // as server returns when store_realt is ready in this case
     if (has_multi_precision_copy(type)) stored.WaitToRead();
-
     auto len = stored.shape().Size() * mshadow::mshadow_sizeof(stored.dtype());
-    response.keys = req_data.keys;
-    response.lens = {len};
-    // TODO(mli) try to remove this CopyFrom
-    response.vals.CopyFrom(static_cast<const char*>(stored.data().dptr_), len);
-    server->Response(req_meta, response);
+
+    // send pull response
+    auto iterator = server_response_map.find(key);
+    if (iterator==server_response_map.end()) { // new key
+      ps::KVPairs<char> response;
+      response.keys = req_data.keys;
+      response.lens = {len};
+
+      stored.WaitToRead();
+      if(enable_pull_zero_copy_) {
+        response.vals = ps::SArray<char>(static_cast<char*>(stored.data().dptr_), len, false); // enable zero copy
+      }
+      else {
+        response.vals.CopyFrom(static_cast<const char*>(stored.data().dptr_), len);
+      }
+      server_response_map[key] = response; // add to the map
+      server->Response(req_meta, response);
+    }
+    else { // not new key, then reuse the memory address to avoid ibv_reg_mr on RDMA data path
+      ps::KVPairs<char> *response = &iterator->second;
+      // keys and lens remain unchanged, just update vals
+      if(enable_pull_zero_copy_) {
+        response->vals = ps::SArray<char>(static_cast<char*>(stored.data().dptr_), len, false); // enable zero copy
+      }
+      else {
+        response->vals.CopyFrom(static_cast<const char*>(stored.data().dptr_), len);
+      }
+      server->Response(req_meta, *response);
+    }
   }
 
   void DataHandleCompressed(const DataHandleType type,
@@ -615,8 +638,8 @@ class KVStoreDistServer {
       CHECK_EQ(req_data.lens.size(), (size_t)2);
       CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[1]);
 
-      int original_size = DecodeKey(req_data.keys[0]);
-      int key = DecodeKey(req_data.keys[1]);
+      uint64_t original_size = DecodeKey(req_data.keys[0]);
+      uint64_t key = DecodeKey(req_data.keys[1]);
       auto& stored = store_[key];
 
       size_t ds[] = {(size_t)req_data.lens[1] / mshadow::mshadow_sizeof(type.dtype)};
@@ -663,8 +686,24 @@ class KVStoreDistServer {
     } else {       // pull
       CHECK_EQ(req_data.keys.size(), (size_t)1);
       CHECK_EQ(req_data.lens.size(), (size_t)0);
-      int key = DecodeKey(req_data.keys[0]);
-      DefaultStorageResponse(type, key, req_meta, req_data, server);
+      // temporarily comment this two lines, should revisit here if we use compression
+      // uint64_t key = DecodeKey(req_data.keys[0]);
+      // DefaultStorageResponse(type, key, req_meta, req_data, server);
+    }
+  }
+
+  void SendPushResponse(uint64_t key, const ps::KVMeta& req, ps::KVServer<char>* server){
+    auto iterator = push_response_map.find(key);
+    if (iterator==push_response_map.end()){ // new key
+      ps::KVPairs<char> response;
+      response.keys.push_back(key);
+      push_response_map[key] = response; // add to the map
+      server->Response(req, response);
+    }
+    else{ // not new key, then reuse the memory address to avoid ibv_reg_mr on RDMA data path
+      ps::KVPairs<char> *response = &iterator->second;
+      response->keys[0]=key;
+      server->Response(req, *response);
     }
   }
 
@@ -676,33 +715,57 @@ class KVStoreDistServer {
     if (req_meta.push) {
       CHECK_EQ(req_data.lens.size(), (size_t)1);
       CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]);
+      if (log_key_info_) LOG(INFO) << "push key=" << DecodeKey(req_data.keys[0])
+                                   << "\t sender=" << req_meta.sender
+                                   << "\t size=" << (size_t) req_data.lens[0];
+    } else {
+      if (log_key_info_) LOG(INFO) << "pull key=" << (uint64_t) DecodeKey(req_data.keys[0])
+                                   << "\t sender=" << req_meta.sender;
     }
-    int key = DecodeKey(req_data.keys[0]);
-    auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
+    uint64_t key = DecodeKey(req_data.keys[0]);
     // there used several WaitToRead, this is because \a recved's memory
     // could be deallocated when this function returns. so we need to make sure
     // the operators with \a NDArray are actually finished
     if (req_meta.push) {
+      auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
       size_t ds[] = {(size_t) req_data.lens[0] / mshadow::mshadow_sizeof(type.dtype)};
       TShape dshape(ds, ds + 1);
       TBlob recv_blob;
-      MSHADOW_REAL_TYPE_SWITCH(type.dtype, DType, {
+      MSHADOW_TYPE_SWITCH(type.dtype, DType, {
         recv_blob = TBlob(reinterpret_cast<DType*>(req_data.vals.data()), dshape, cpu::kDevMask);
       })
       NDArray recved = NDArray(recv_blob, 0);
       if (stored.is_none()) {
+        // buffer the request meta
+        auto &updates = update_buf_[key];
+        updates.request.push_back(req_meta);
+
+        if (updates.request.size() < (size_t) ps::NumWorkers()) return;
+
+        if (log_key_info_) {
+          LOG(INFO) << "Collected all " << updates.request.size()
+                    << " requests for key=" << key
+                    << ", init the store buffer size=" << (size_t) req_data.lens[0];
+        }
+
         // initialization
         stored = NDArray(dshape, Context(), false,
                          has_multi_precision_copy(type) ? mshadow::kFloat32 : type.dtype);
         CopyFromTo(recved, &stored, 0);
-        server->Response(req_meta);
         if (has_multi_precision_copy(type)) {
           auto& stored_dtype = store_[key];
           stored_dtype = NDArray(dshape, Context(), false, type.dtype);
           CopyFromTo(stored, stored_dtype);
           stored_dtype.WaitToRead();
         }
+        // delay sending response until stored is ready
         stored.WaitToRead();
+
+        for (const auto& req : updates.request) {
+          SendPushResponse(key, req, server);
+        }
+
+        updates.request.clear();
       } else {
         auto &updates = update_buf_[key];
         if (sync_mode_ && updates.merged.is_none()) {
@@ -712,7 +775,7 @@ class KVStoreDistServer {
         if (has_multi_precision_copy(type) && updates.temp_array.is_none()) {
           updates.temp_array = NDArray(dshape, Context(), false, mshadow::kFloat32);
         }
-        if (updates.request.empty()) {
+        if (updates.request.empty()) { // from the first incoming worker
           if (sync_mode_) {
             CopyFromTo(recved, updates.merged);
           } else {
@@ -722,7 +785,7 @@ class KVStoreDistServer {
               updates.temp_array = recved;
             }
           }
-        } else {
+        } else { // from other workers
           CHECK(sync_mode_);
           if (has_multi_precision_copy(type)) {
             CopyFromTo(recved, updates.temp_array);
@@ -731,19 +794,27 @@ class KVStoreDistServer {
             updates.merged += recved;
           }
         }
+        // add a worker information (request.size() is the # workers received)
         updates.request.push_back(req_meta);
+        SendPushResponse(key, req_meta, server);
         ApplyUpdates(type, key, &updates, server);
       }
     } else {
+      auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
+      if (stored.is_none()) {
+        CHECK(0) << "Processing pull request when the NDArray of key " << key << " has not been inited yet, which is not expected.";
+      }
+
+      // process pull request
+      auto &updates = update_buf_[key];
       DefaultStorageResponse(type, key, req_meta, req_data, server);
     }
   }
 
-  int DecodeKey(ps::Key key) {
+  uint64_t DecodeKey(ps::Key key) {
     auto kr = ps::Postoffice::Get()->GetServerKeyRanges()[ps::MyRank()];
     return key - kr.begin();
   }
-
 
   /**
    * \brief user defined mode for push
@@ -755,21 +826,21 @@ class KVStoreDistServer {
   /**
    * \brief store_ contains the value at kvstore for each key
    */
-  std::unordered_map<int, NDArray> store_;
-  std::unordered_map<int, NDArray> store_realt_;
+  std::unordered_map<uint64_t, NDArray> store_;
+  std::unordered_map<uint64_t, NDArray> store_realt_;
 
   /**
    * \brief merge_buf_ is a buffer used if sync_mode is true. It represents
    * values from different workers being merged. The store will be updated
    * to this value when values from all workers are pushed into this buffer.
    */
-  std::unordered_map<int, UpdateBuf> update_buf_;
+  std::unordered_map<uint64_t, UpdateBuf> update_buf_;
 
   /**
    * \brief decomp_buf_ is a buffer into which compressed values are
    * decompressed before merging to the store. used when compress_!='none'
    */
-  std::unordered_map<int, NDArray> decomp_buf_;
+  std::unordered_map<uint64_t, NDArray> decomp_buf_;
 
   Executor exec_;
   ps::KVServer<char>* ps_server_;
@@ -777,12 +848,23 @@ class KVStoreDistServer {
   // whether to LOG verbose information
   bool log_verbose_;
 
+  // whether to LOG key trace
+  bool log_key_info_;
+
+  // whether to enable zero copy for pull request
+  bool enable_pull_zero_copy_;
   /*
    * \brief whether to use multi precision mode.
    * in multi precision mode, all weights are stored as float32.
    * any gradient received will be cast to float32 before accumulation and updating of weights.
    */
   bool multi_precision_;
+
+  bool update_buf_wait_;
+  /*
+   * send push response with the key as value
+   */
+  std::unordered_map<uint64_t, ps::KVPairs<char> > push_response_map;
 
   /**
    * \brief gradient compression object.
