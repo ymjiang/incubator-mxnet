@@ -100,12 +100,12 @@ def config_cython():
         return []
 
 
-setup(name='mxnet',
+setup(name='byteps_server',
       version=__version__,
-      description=open(os.path.join(CURRENT_DIR, 'README.md')).read(),
+      description="BytePS server",
       packages=find_packages(),
       data_files=[('mxnet', [LIB_PATH[0]])],
-      url='https://github.com/apache/incubator-mxnet',
+      url='https://github.com/bytedance/incubator-mxnet',
       ext_modules=config_cython(),
       classifiers=[
           # https://pypi.org/pypi?%3Aaction=list_classifiers
