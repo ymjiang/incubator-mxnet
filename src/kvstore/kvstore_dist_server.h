@@ -798,7 +798,7 @@ class KVStoreDistServer {
           } else {
             Engine::Get()->PushAsync(
             [updates.merged, recved](RunContext ctx, Engine::CallbackOnComplete on_complete) {
-              CHECK_GE(bps_reducer_.sum(updates.merged.data(), recved.data(),
+              CHECK_GE(bps_reducer_.sum(bps_reducer_.GetData(updates.merged), bps_reducer_.GetData(recved),
                                         bps_reducer_.GetSize(recved), bps_reducer_.GetDType(recved)), 0);
               on_complete();
             }, updates.merged.ctx(), {recved.var()}, {updates.merged.var()},

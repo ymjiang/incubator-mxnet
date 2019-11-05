@@ -38,6 +38,31 @@ class CpuReducer {
 
   int sum(void* dst, void* src, size_t len, DataType dtype);
 
+  // Return data of tensor
+  const void* GetData(NDArray* tensor) {
+    // The following returns an error:
+    // return tensor->data().dptr<void>();
+    switch (tensor->dtype()) {
+      case mshadow::kFloat32:
+        return static_cast<void*>(tensor->data().dptr<float>());
+      case mshadow::kFloat64:
+        return static_cast<void*>(tensor->data().dptr<double>());
+      case mshadow::kFloat16:
+        return static_cast<void*>(tensor->data().dptr<mshadow::half::half_t>());
+      case mshadow::kUint8:
+        return static_cast<void*>(tensor->data().dptr<uint8_t>());
+      case mshadow::kInt32:
+        return static_cast<void*>(tensor->data().dptr<int32_t>());
+      case mshadow::kInt8:
+        return static_cast<void*>(tensor->data().dptr<int8_t>());
+      case mshadow::kInt64:
+        return static_cast<void*>(tensor->data().dptr<int64_t>());
+      default:
+        throw std::logic_error("Type " + std::to_string(tensor->dtype()) +
+                              " is not supported in BytePS.");
+    }
+  }
+
   const DataType GetDType(NDArray* tensor) {
     switch (tensor->dtype()) {
       case mshadow::kFloat32:
