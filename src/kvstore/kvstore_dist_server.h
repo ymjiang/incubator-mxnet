@@ -42,6 +42,7 @@
 #include "../profiler/profiler.h"
 #include "../operator/tensor/elemwise_binary_op-inl.h"
 #include "../operator/tensor/init_op.h"
+#include "cpu_reducer.h"
 
 namespace mxnet {
 namespace kvstore {
@@ -235,10 +236,7 @@ class KVStoreDistServer {
         break;
       case CommandType::kSetMultiPrecision:
         // uses value 1 for message id from frontend
-        if (!multi_precision_) {
-          multi_precision_ = true;
-          CreateMultiPrecisionCopies();
-        }
+        CHECK(0) << "kSetMultiPrecision is not available now";
         break;
       case CommandType::kController:
         // this uses value 0 for message id from frontend
@@ -798,7 +796,13 @@ class KVStoreDistServer {
             CopyFromTo(recved, updates.temp_array);
             updates.merged += updates.temp_array;
           } else {
-            updates.merged += recved;
+            Engine::Get()->PushAsync(
+            [updates.merged, recved](RunContext ctx, Engine::CallbackOnComplete on_complete) {
+              CHECK_GE(bps_reducer_.sum(updates.merged.data(), recved.data(),
+                                        bps_reducer_.GetSize(recved), bps_reducer_.GetDType(recved)), 0);
+              on_complete();
+            }, updates.merged.ctx(), {recved.var()}, {updates.merged.var()},
+            FnProperty::kNormal, 0, "BYTEPS_SUMMATION");
           }
         }
         // add a worker information (request.size() is the # workers received)
@@ -868,6 +872,8 @@ class KVStoreDistServer {
   bool multi_precision_;
 
   bool update_buf_wait_;
+
+  byteps::common::CpuReducer bps_reducer_;
 
   /*
    * send push response with the key as value
