@@ -12,8 +12,8 @@
 #include <mxnet/base.h>
 #include <mxnet/ndarray.h>
 
-namespace byteps {
-namespace common {
+namespace mxnet {
+namespace kvstore {
 
 enum DataType {
   BYTEPS_FLOAT32 = 0,
@@ -326,7 +326,7 @@ int CpuReducer::_sum_float16(void* dst, void* src, size_t len) {
   return 0;
 }
 
-}  // namespace common
-}  // namespace byteps
+}  // namespace kvstore
+}  // namespace mxnet
 
 #endif  // BYTEPS_CPU_REDUCER_H
