@@ -39,7 +39,7 @@ class CpuReducer {
   int sum(void* dst, void* src, size_t len, DataType dtype);
 
   // Return data of tensor
-  const void* GetData(NDArray* tensor) {
+  void* GetData(const NDArray* tensor) {
     // The following returns an error:
     // return tensor->data().dptr<void>();
     switch (tensor->dtype()) {
@@ -63,7 +63,7 @@ class CpuReducer {
     }
   }
 
-  const DataType GetDType(NDArray* tensor) {
+  DataType GetDType(const NDArray* tensor) {
     switch (tensor->dtype()) {
       case mshadow::kFloat32:
         return DataType::BYTEPS_FLOAT32;
@@ -86,7 +86,7 @@ class CpuReducer {
     }
   }
 
-  int64_t GetSize(NDArray* tensor) {
+  int64_t GetSize(const NDArray* tensor) {
     int64_t element_size = 0;
     switch (tensor->dtype()) {
       case mshadow::kFloat32:
