@@ -184,6 +184,11 @@ class KVStoreDistServer {
     if (!sync_mode_) {
       LOG(INFO) << "BytePS server is enabled asynchronous training";
     }
+
+    skip_sum_ = dmlc::GetEnv("BYTEPS_SERVER_SKIP_SUM", false);
+    if (skip_sum_) {
+      LOG(INFO) << "BytePS server skips summation! (should be perf test only)";
+    }
   }
 
   ~KVStoreDistServer() {
@@ -796,13 +801,15 @@ class KVStoreDistServer {
             CopyFromTo(recved, updates.temp_array);
             updates.merged += updates.temp_array;
           } else {
-            Engine::Get()->PushAsync(
-            [this, updates, recved](RunContext ctx, Engine::CallbackOnComplete on_complete) {
-              CHECK_GE(bps_reducer_.sum(bps_reducer_.GetData(&updates.merged), bps_reducer_.GetData(&recved),
-                                        bps_reducer_.GetSize(&recved), bps_reducer_.GetDType(&recved)), 0);
-              on_complete();
-            }, updates.merged.ctx(), {recved.var()}, {updates.merged.var()},
-            FnProperty::kNormal, 0, "BYTEPS_SUMMATION");
+            if (!skip_sum_) {
+              Engine::Get()->PushAsync(
+              [this, updates, recved](RunContext ctx, Engine::CallbackOnComplete on_complete) {
+                CHECK_GE(bps_reducer_.sum(bps_reducer_.GetData(&updates.merged), bps_reducer_.GetData(&recved),
+                                          bps_reducer_.GetSize(&recved), bps_reducer_.GetDType(&recved)), 0);
+                on_complete();
+              }, updates.merged.ctx(), {recved.var()}, {updates.merged.var()},
+              FnProperty::kNormal, 0, "BYTEPS_SUMMATION");
+            }
           }
         }
         // add a worker information (request.size() is the # workers received)
@@ -872,6 +879,8 @@ class KVStoreDistServer {
   bool multi_precision_;
 
   bool update_buf_wait_;
+
+  bool skip_sum_ = false;
 
   CpuReducer bps_reducer_;
 
