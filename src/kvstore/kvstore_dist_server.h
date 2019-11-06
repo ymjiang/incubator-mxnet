@@ -873,7 +873,7 @@ class KVStoreDistServer {
 
   bool update_buf_wait_;
 
-  byteps::common::CpuReducer bps_reducer_;
+  CpuReducer bps_reducer_;
 
   /*
    * send push response with the key as value
