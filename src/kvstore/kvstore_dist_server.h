@@ -185,9 +185,14 @@ class KVStoreDistServer {
       LOG(INFO) << "BytePS server is enabled asynchronous training";
     }
 
-    skip_sum_ = dmlc::GetEnv("BYTEPS_SERVER_SKIP_SUM", false);
-    if (skip_sum_) {
-      LOG(INFO) << "BytePS server skips summation! (should be perf test only)";
+    skip_ = dmlc::GetEnv("BYTEPS_SERVER_SKIP_SUM", false);
+    if (skip_) {
+      LOG(INFO) << "BytePS server skips enabled! (should be perf test only)";
+    }
+    
+    wait_ = dmlc::GetEnv("BYTEPS_SERVER_STORE_WAIT", true);
+    if (!wait_) {
+      LOG(INFO) << "BytePS server no stored.wait()! (should be perf test only)";
     }
   }
 
@@ -373,12 +378,15 @@ class KVStoreDistServer {
       // NOTE: not sure whether we need this WaitToRead, default is disabled
       if (update_buf_wait_) update_buf->merged.WaitToRead();
 
-      // async mode does not need this Copy
-      if (sync_mode_) CopyFromTo(update_buf->merged, &stored);
+      if (skip_) {
+        // async mode does not need this Copy
+        if (sync_mode_) CopyFromTo(update_buf->merged, &stored);
+      }
 
       if (has_multi_precision_copy(type)) CopyFromTo(stored, store_[key]);
       update_buf->request.clear();
-      stored.WaitToRead();
+
+      if (wait_) stored.WaitToRead();
     } else {
       update_buf->merged.WaitToRead();
     }
@@ -801,7 +809,7 @@ class KVStoreDistServer {
             CopyFromTo(recved, updates.temp_array);
             updates.merged += updates.temp_array;
           } else {
-            if (!skip_sum_) {
+            if (!skip_) {
               Engine::Get()->PushAsync(
               [this, updates, recved](RunContext ctx, Engine::CallbackOnComplete on_complete) {
                 CHECK_GE(bps_reducer_.sum(bps_reducer_.GetData(&updates.merged), bps_reducer_.GetData(&recved),
@@ -880,7 +888,8 @@ class KVStoreDistServer {
 
   bool update_buf_wait_;
 
-  bool skip_sum_ = false;
+  bool skip_ = false;
+  bool wait_ = true;
 
   CpuReducer bps_reducer_;
 
