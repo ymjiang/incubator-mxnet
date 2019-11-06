@@ -253,8 +253,8 @@ class CpuReducer {
 
 
 CpuReducer::CpuReducer() {
-  if (getenv("BYTEPS_OMP_THREAD_PER_GPU")) {
-    _num_threads = atoi(getenv("BYTEPS_OMP_THREAD_PER_GPU"));
+  if (getenv("BYTEPS_SERVER_OMP_THREAD_NUM")) {
+    _num_threads = atoi(getenv("BYTEPS_SERVER_OMP_THREAD_NUM"));
   } else {
     _num_threads = 4;
   }
